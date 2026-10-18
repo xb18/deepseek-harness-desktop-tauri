@@ -1658,6 +1658,7 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::read_clipboard_text,
         crate::bridge::write_clipboard_text,
         crate::desktop::window::create_app_window,
+        crate::desktop::window::activate_notification_window,
         crate::desktop::builder::sync_view_menu,
         crate::desktop::window::quit_app,
         crate::desktop::window::toggle_devtools,

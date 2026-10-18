@@ -7,6 +7,8 @@ export interface NotificationExtra {
   sessionId?: string
   title?: string
   tag?: string
+  /** 发出这条通知的壳层窗口 label（`main` / `window-*` / `remote-*`）。 */
+  windowLabel?: string
 }
 
 /**

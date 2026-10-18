@@ -9,12 +9,17 @@ const mocks = vi.hoisted(() => ({
   requestPermission: vi.fn<() => Promise<NotificationPermission>>(),
   registerActionTypes: vi.fn(),
   sendNotification: vi.fn(),
+  invoke: vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(),
+  post: vi.fn(),
   openConfigDialog: vi.fn(),
   toast: vi.fn(),
   onMessage: undefined as ((data: Record<string, unknown>) => void) | undefined,
+  onClicked: undefined as ((event: { data?: Record<string, unknown> }) => void) | undefined,
 }))
 
 vi.mock('@choochmeque/tauri-plugin-notifications-api', () => mocks)
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
+vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ label: 'window-2' }) }))
 vi.mock('@heroui/react', () => ({ toast: mocks.toast }))
 vi.mock('@overlastic/react', () => ({ useOverlay: () => mocks.openConfigDialog }))
 vi.mock('@/ui/dialog/config', () => ({ ConfigDialog: () => null }))
@@ -33,10 +38,12 @@ vi.mock('@/hooks/use-dsh-style', () => ({ useDshStyle: () => [null, vi.fn()] }))
 vi.mock('@/hooks/use-iframe-message', () => ({
   useIframeMessage: (_ref: unknown, handler: typeof mocks.onMessage) => { mocks.onMessage = handler },
 }))
-vi.mock('@/hooks/use-iframe-post', () => ({ useIframePost: () => vi.fn() }))
+vi.mock('@/hooks/use-iframe-post', () => ({ useIframePost: () => mocks.post }))
 vi.mock('@/hooks/use-invoke-iframe', () => ({ useInvokeIframe: vi.fn() }))
 vi.mock('@/hooks/use-notification-action', () => ({ useNotificationAction: vi.fn() }))
-vi.mock('@/hooks/use-notification-clicked', () => ({ useNotificationClicked: vi.fn() }))
+vi.mock('@/hooks/use-notification-clicked', () => ({
+  useNotificationClicked: (handler: typeof mocks.onClicked) => { mocks.onClicked = handler },
+}))
 vi.mock('@/hooks/use-sync-visibility', () => ({ useSyncVisibility: vi.fn() }))
 vi.mock('@/hooks/use-zoom-factor', () => ({ useZoomFactor: vi.fn() }))
 vi.mock('@/hooks/use-appearance', () => ({ useAppearance: () => '' }))
@@ -67,6 +74,7 @@ beforeEach(() => {
   mocks.registerActionTypes.mockResolvedValue(undefined)
   mocks.sendNotification.mockResolvedValue(undefined)
   mocks.openConfigDialog.mockResolvedValue(undefined)
+  mocks.invoke.mockResolvedValue(null)
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   renderToStaticMarkup(createElement(Iframe, {
@@ -76,6 +84,7 @@ beforeEach(() => {
 
 afterEach(() => {
   mocks.onMessage = undefined
+  mocks.onClicked = undefined
   vi.restoreAllMocks()
 })
 
@@ -132,7 +141,7 @@ describe('iframe native notification authorization', () => {
       body: 'Approve the tool',
       silent: true,
       actionTypeId: 'dsh-notification-approve',
-      extra: { sessionId: 'session', title: 'Permission required', tag: 'dsh-notification-session-1' },
+      extra: { sessionId: 'session', title: 'Permission required', tag: 'dsh-notification-session-1', windowLabel: 'window-2' },
     })
   })
 
@@ -203,5 +212,69 @@ describe('iframe native notification authorization', () => {
     expect(mocks.isPermissionGranted).toHaveBeenCalledTimes(2)
     expect(mocks.requestPermission).toHaveBeenCalledOnce()
     expect(mocks.sendNotification).toHaveBeenCalledOnce()
+  })
+})
+
+function click(data: Record<string, unknown> = {}) {
+  if (!mocks.onClicked)
+    throw new Error('Iframe notification click handler was not registered')
+  mocks.onClicked({
+    data: {
+      sessionId: 'session',
+      title: 'Ready',
+      tag: 'dsh-notification-session-1',
+      windowLabel: 'window-2',
+      ...data,
+    },
+  })
+}
+
+describe('iframe native notification click', () => {
+  it('focuses the session only in the window selected by the host', async () => {
+    mocks.invoke.mockResolvedValue('window-2')
+
+    click()
+    await settle()
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('activate_notification_window', { owner: 'window-2' })
+    expect(mocks.post).toHaveBeenCalledWith({
+      type: 'dsh://focus-session',
+      sessionId: 'session',
+      title: 'Ready',
+      tag: 'dsh-notification-session-1',
+    })
+  })
+
+  it('leaves every window other than the selected target untouched', async () => {
+    // 其它窗口（尤其是关到托盘后仍活着的窗口）不能因为一次点击就把自己 show 出来。
+    mocks.invoke.mockResolvedValue('main')
+
+    click()
+    await settle()
+
+    expect(mocks.post).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'dsh://focus-session' }))
+    // 点击回灌仍要广播：各窗口通知 shim 的 pendingOnClicks 靠它释放实例。
+    expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ type: 'dsh://notification-clicked' }))
+  })
+
+  it('falls back to host selection for notifications without an owner label', async () => {
+    mocks.invoke.mockResolvedValue('window-2')
+
+    click({ windowLabel: undefined })
+    await settle()
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('activate_notification_window', { owner: null })
+    expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ type: 'dsh://focus-session' }))
+  })
+
+  it('delivers the click payload even when the window cannot be activated', async () => {
+    mocks.invoke.mockRejectedValue(new Error('window API unavailable'))
+
+    click()
+    await settle()
+
+    expect(console.error).toHaveBeenCalledWith('[notification] activate window failed:', expect.any(Error))
+    expect(mocks.post).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'dsh://focus-session' }))
+    expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ type: 'dsh://notification-clicked' }))
   })
 })

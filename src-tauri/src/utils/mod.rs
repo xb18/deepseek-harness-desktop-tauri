@@ -71,14 +71,40 @@ pub fn show_window<R: Runtime>(window: &WebviewWindow<R>) {
     let _ = window.set_focus();
 }
 
+/// 壳层窗口标签：主窗口、「文件 → 新建窗口」的 `window-*`、SSH 远端的 `remote-*`。
+pub(crate) fn is_shell_window_label(label: &str) -> bool {
+    label == "main" || label.starts_with("window-") || label.starts_with("remote-")
+}
+
+/// 把壳层窗口拉回前台；托盘恢复、macOS Dock 点击与通知点击共用同一套平台收尾。
+pub(crate) fn reveal_shell_window<R: Runtime>(app: &AppHandle<R>, window: &WebviewWindow<R>) {
+    // 非 macOS 没有应用级 hide，这里的 app 只服务于 macOS 的平台收尾。
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+    // 关窗驻留用的是应用级 hide（NSApp hide:，见 builder 的 CloseRequested），
+    // 恢复前必须先 unhide 整个应用，否则 window.show() 在隐藏态应用上不可见。
+    #[cfg(target_os = "macos")]
+    if let Err(error) = app.show() {
+        log::warn!("[window] APP_SHOW_FAILED: {error}");
+    }
+    // Accessory 下 window.show() 有历史问题（tauri #5122），必须先切回 regular 再 show。
+    #[cfg(target_os = "macos")]
+    crate::desktop::activation::set_regular_policy(app);
+    show_window(window);
+    // 恢复路径不改变全屏状态：全屏关窗后恢复，窗口依旧全屏；而 set_regular_policy
+    // 已无条件清掉推迟标志，这里按需重新挂起，否则用户退出全屏时 Accessory 永不生效。
+    #[cfg(target_os = "macos")]
+    crate::desktop::activation::rearm_pending_accessory_if_fullscreen(window);
+}
+
 /// 显示主窗口：托盘「打开面板」、托盘左键点击、macOS Dock 图标点击共用。
 /// 关闭按钮只隐藏窗口（见 builder 的 on_window_event），所以这里取到即可 show；
 /// 若窗口确实不存在（非预期路径），仅记录日志，不重建。
 pub fn shell_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
     app.get_webview_window("main").or_else(|| {
-        app.webview_windows().into_values().find(|window| {
-            window.label().starts_with("window-") || window.label().starts_with("remote-")
-        })
+        app.webview_windows()
+            .into_values()
+            .find(|window| is_shell_window_label(window.label()))
     })
 }
 
@@ -89,7 +115,7 @@ pub fn operation_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<
         .filter(|window| instances::window_uses_profile(window.label(), &profile))
         .or_else(|| {
             app.webview_windows().into_values().find(|window| {
-                (window.label().starts_with("window-") || window.label().starts_with("remote-"))
+                is_shell_window_label(window.label())
                     && instances::window_uses_profile(window.label(), &profile)
             })
         })
@@ -97,31 +123,68 @@ pub fn operation_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<
 
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = shell_window(app) {
-        // 关窗驻留用的是应用级 hide（NSApp hide:，见 builder 的 CloseRequested），
-        // 恢复前必须先 unhide 整个应用，否则 window.show() 在隐藏态应用上不可见。
-        #[cfg(target_os = "macos")]
-        if let Err(error) = app.show() {
-            log::warn!("[window] APP_SHOW_FAILED: {error}");
-        }
-        // Accessory 下 window.show() 有历史问题（tauri #5122），必须先切回
-        // regular 再 show；放在这里可一次覆盖托盘菜单「打开面板」、托盘左键、
-        // RunEvent::Reopen、release single-instance 四条恢复路径。
-        #[cfg(target_os = "macos")]
-        crate::desktop::activation::set_regular_policy(app);
-        // 恢复路径不改变全屏状态：全屏关窗后从托盘恢复，窗口依旧全屏。
-        // 不在此重新挂起 Accessory：窗口此时已可见，若挂起推迟标志，用户
-        // 退出全屏时 on_window_resized 会把可见应用切进 Accessory，导致 Dock
-        // 图标与 ⌘-Tab 在窗口仍打开时消失。Accessory 只在关窗驻留路径的
-        // hide 之后生效，前台可见态应保持 regular。
-        show_window(&window);
-        // 恢复路径不改变全屏状态：全屏关窗后从托盘恢复，窗口依旧全屏，
-        // 而 set_regular_policy 已无条件清掉推迟标志。这里按需重新挂起，
-        // 否则用户退出全屏时 Accessory 永不生效（Dock / ⌘-Tab 整个驻留期可见）。
-        #[cfg(target_os = "macos")]
-        crate::desktop::activation::rearm_pending_accessory_if_fullscreen(&window);
+        reveal_shell_window(app, &window);
     } else {
         log::warn!("[window] main window not found, skip show");
     }
+}
+
+/// 通知点击要激活的唯一壳层窗口。
+///
+/// 通知插件把点击事件广播给所有注册了监听的窗口，而关闭按钮只是把窗口隐藏到托盘
+/// （见 `desktop::builder` 的 `CloseRequested`）：若每个窗口都把自己 show 出来，
+/// 用户先前关掉的一排窗口会随一次通知点击全部复活。这里按「焦点窗口 → 主窗口 →
+/// 可见窗口 → 通知来源窗口 → 任意壳层窗口」挑一个，其余窗口只比较标签、不再动作。
+pub fn notification_window<R: Runtime>(
+    app: &AppHandle<R>,
+    owner: Option<&str>,
+) -> Option<WebviewWindow<R>> {
+    let windows = app.webview_windows();
+    let label = select_notification_window(
+        windows.values().map(|window| {
+            (
+                window.label(),
+                window.is_focused().unwrap_or(false),
+                window.is_visible().unwrap_or(false),
+            )
+        }),
+        owner,
+    )?;
+    windows.get(label).cloned()
+}
+
+/// [`notification_window`] 的纯选择逻辑。并列候选取字典序最小，保证各窗口独立
+/// 计算得到同一答案——否则多个窗口会同时认定自己该被激活，又变回整排复活。
+fn select_notification_window<'a>(
+    windows: impl IntoIterator<Item = (&'a str, bool, bool)>,
+    owner: Option<&str>,
+) -> Option<&'a str> {
+    let mut focused = None;
+    let mut main = None;
+    let mut visible = None;
+    let mut owned = None;
+    let mut first = None;
+    for (label, window_focused, window_visible) in windows {
+        if !is_shell_window_label(label) {
+            continue;
+        }
+        if first.is_none_or(|current| label < current) {
+            first = Some(label);
+        }
+        if window_focused && focused.is_none_or(|current| label < current) {
+            focused = Some(label);
+        }
+        if label == "main" {
+            main = Some(label);
+        }
+        if window_visible && visible.is_none_or(|current| label < current) {
+            visible = Some(label);
+        }
+        if owner == Some(label) {
+            owned = Some(label);
+        }
+    }
+    focused.or(main).or(visible).or(owned).or(first)
 }
 
 /// 解码子进程输出的一行。
@@ -283,9 +346,99 @@ pub(crate) fn console_code_page() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_process_line;
     #[cfg(windows)]
     use super::{decode_multibyte, encode_multibyte, short_path};
+    use super::{decode_process_line, select_notification_window};
+
+    #[test]
+    fn focused_shell_window_wins_notification_activation() {
+        assert_eq!(
+            select_notification_window(
+                [
+                    ("main", false, true),
+                    ("window-1", true, true),
+                    ("window-2", false, false),
+                ],
+                Some("window-2"),
+            ),
+            Some("window-1")
+        );
+    }
+
+    #[test]
+    fn main_window_wins_notification_activation_without_focus() {
+        // 用户关掉的附加窗口仍然活着（隐藏到托盘），通知点击不能把它们整排拉起来。
+        assert_eq!(
+            select_notification_window(
+                [
+                    ("window-1", false, true),
+                    ("main", false, true),
+                    ("window-2", false, false),
+                ],
+                Some("window-2"),
+            ),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn visible_window_wins_before_the_hidden_notification_owner() {
+        // 主窗口不存在时，优先回到当前看得见的窗口，而不是把关进托盘的来源窗口拉出来。
+        assert_eq!(
+            select_notification_window(
+                [("window-1", false, false), ("window-2", false, true),],
+                Some("window-1"),
+            ),
+            Some("window-2")
+        );
+    }
+
+    #[test]
+    fn notification_owner_is_used_when_main_is_gone() {
+        assert_eq!(
+            select_notification_window(
+                [("window-1", false, false), ("window-2", false, false),],
+                Some("window-2"),
+            ),
+            Some("window-2")
+        );
+    }
+
+    #[test]
+    fn notification_activation_ignores_non_shell_windows() {
+        // 桌宠等非壳层窗口即使拿到焦点，也不能成为通知点击的落点。
+        assert_eq!(
+            select_notification_window(
+                [
+                    ("pet", true, true),
+                    ("window-1", false, false),
+                    ("window-2", false, false),
+                ],
+                Some("pet"),
+            ),
+            Some("window-1")
+        );
+        assert_eq!(
+            select_notification_window([("pet", true, true)], None),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_activation_is_deterministic_between_for_idle_windows() {
+        // 没有焦点 / 主窗口 / 来源信息时按字典序取最小标签：各窗口独立计算得到同一答案，
+        // 否则它们会同时把自己激活，又变成整排窗口复活。
+        let forward = select_notification_window(
+            [("window-2", false, false), ("window-10", false, false)],
+            None,
+        );
+        let backward = select_notification_window(
+            [("window-10", false, false), ("window-2", false, false)],
+            None,
+        );
+        assert_eq!(forward, Some("window-10"));
+        assert_eq!(backward, Some("window-10"));
+    }
 
     #[tokio::test]
     async fn operation_window_never_falls_back_to_another_profile() {

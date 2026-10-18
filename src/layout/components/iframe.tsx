@@ -91,6 +91,8 @@ export interface NotificationClickedPayload {
   action?: string | null
   /** 带输入框的按钮：用户在系统通知里填的文本。 */
   inputValue?: string | null
+  /** 发出通知的窗口 label；用于只让一个窗口响应点击。 */
+  owner?: string | null
 }
 
 /** 插件的动作类型载荷（它的 `ActionType` 没有从 JS API 导出，这里从函数签名反推）。 */
@@ -508,6 +510,7 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
             sessionId: data.sessionId ?? '',
             title,
             tag: data.tag ?? '',
+            windowLabel: getCurrentWindow().label,
           },
         })
       }
@@ -562,23 +565,26 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
   }
 
   /**
-   * 点通知本体：先把窗口拉回前台，再让帧内聚焦对应会话。
+   * 点通知本体：由 Rust 选出唯一的落点窗口并把它拉回前台，只有该窗口继续让帧内聚焦会话。
    *
-   * 窗口这一步是必需的：点通知时窗口多半在后台（最小化 / 被别的窗口盖住），
-   * 只回灌 iframe 消息的话用户看不到任何变化。失败只记录日志——窗口 API 报错不该
-   * 阻断帧内的会话切换与按钮回调。
+   * 点击事件会广播给所有壳层窗口，而关闭按钮只是把窗口隐藏到托盘（隐藏窗口依旧是
+   * 订阅者）：以前每个窗口都 show 自己，用户关掉的一排窗口会随一次点击整排复活。
+   * 落到哪个窗口由 `activate_notification_window` 统一决定（焦点 → 主窗口 → 可见窗口
+   * → 通知来源 → 任意壳层窗口），这里只比较标签，非落点窗口不做任何事。宿主不可用时
+   * 静默放弃——窗口 API 报错不该阻断帧内已有的会话切换与按钮回调。
    */
   async function activateApplication(payload: NotificationClickedPayload) {
+    let target: string | null = null
     try {
-      const appWindow = getCurrentWindow()
-      if (await appWindow.isMinimized())
-        await appWindow.unminimize()
-      await appWindow.show()
-      await appWindow.setFocus()
+      target = await invoke<string | null>('activate_notification_window', {
+        owner: payload.owner || null,
+      })
     }
     catch (error) {
-      console.error('[notification] focus window failed:', error)
+      console.error('[notification] activate window failed:', error)
     }
+    if (target !== getCurrentWindow().label)
+      return
     post({
       type: 'dsh://focus-session',
       sessionId: payload.sessionId || undefined,
@@ -668,6 +674,7 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
       sessionId: data?.sessionId ?? null,
       title: data?.title,
       tag: data?.tag,
+      owner: data?.windowLabel ?? null,
     }
     void activateApplication(payload).then(() => deliverNotificationResult(payload))
   }

@@ -192,6 +192,24 @@ mod session_navigation_tests {
     }
 }
 
+/// 系统通知被点击：把唯一的落点窗口拉回前台，并返回它的 label。
+///
+/// 通知插件的点击事件会广播给**所有**注册了监听的窗口，而本项目「关闭」只是隐藏到
+/// 托盘（见 `desktop::builder` 的 `CloseRequested`），隐藏窗口依旧是活跃监听者。若每个
+/// 窗口都把自己 show 出来，关掉的一排窗口会随一次通知点击整排复活；因此由 Rust 侧统一
+/// 选一个目标窗口（焦点 → 主窗口 → 可见窗口 → 通知来源 → 任意壳层窗口），调用方只在
+/// 自己 label 与返回值一致时才继续切会话。`owner` 是发通知时写进 `extra` 的窗口 label，
+/// 旧通知没有该字段，此时退化为按焦点 / 主窗口选择。
+#[tauri::command]
+pub fn activate_notification_window(
+    app_handle: AppHandle<Wry>,
+    owner: Option<String>,
+) -> Option<String> {
+    let window = crate::utils::notification_window(&app_handle, owner.as_deref())?;
+    crate::utils::reveal_shell_window(&app_handle, &window);
+    Some(window.label().to_owned())
+}
+
 /// 壳层导航栏「文件 → 退出」：与托盘「退出」同语义，走 `exit(0)` 完整退出
 /// （触发 `RunEvent::ExitRequested` 的主窗口几何保存与 `RunEvent::Exit` 的进程回收）。
 #[tauri::command]
